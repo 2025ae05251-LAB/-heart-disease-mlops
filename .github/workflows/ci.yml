@@ -5,12 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   build-test-train:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Check out code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -36,16 +37,63 @@ jobs:
         run: python src/train.py
 
       - name: Run unit tests
-        run: pytest -v --cov=src --cov-report=xml --junitxml=pytest-report.xml
+        run: |
+          set -o pipefail
+          pytest -v --cov=src --cov-report=xml --cov-report=term 2>&1 | tee pytest.log
 
-      - name: Upload artifacts
+      - name: Upload training outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ml-pipeline-outputs
+          name: training-outputs
           path: |
             models/
-            screenshots/training/
             mlflow.db
+            screenshots/training/
             coverage.xml
-            pytest-report.xml
+            pytest.log
+          if-no-files-found: warn
+
+  docker-build-test:
+    runs-on: ubuntu-latest
+    needs: build-test-train
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t heart-api:ci .
+
+      - name: Run container
+        run: docker run -d --name heart-api -p 8000:8000 heart-api:ci
+
+      - name: Wait for API to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs heart-api
+          exit 1
+
+      - name: Test /predict with sample input
+        run: |
+          curl -sf -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d @sample_input.json | tee response.json
+          echo
+          python3 -c "import json; r=json.load(open('response.json')); assert r['prediction'] in (0, 1) and 0.5 <= r['confidence'] <= 1.0"
+
+      - name: Save container logs
+        if: always()
+        run: docker logs heart-api > docker-logs.txt 2>&1
+
+      - name: Upload container logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-logs
+          path: docker-logs.txt
